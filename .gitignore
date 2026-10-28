@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+*.log
+
+# Runtime messages and preferences must stay on the AstrBot host.
+chat_console.db
+chat_console.db-shm
+chat_console.db-wal
+messages.json
+messages.json.migrated
+pinned_groups.json
+group_settings.json
+
+# Internal handoff notes are not part of the public plugin package.
+DEVELOPMENT.md

@@ -1,0 +1,7 @@
+{
+  "dark_mode": {
+    "description": "聊天控制台默认使用深色模式",
+    "type": "bool",
+    "default": true
+  }
+}
