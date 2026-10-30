@@ -3,5 +3,41 @@
     "description": "聊天控制台默认使用深色模式",
     "type": "bool",
     "default": true
+  },
+  "merge_isolated_sessions": {
+    "description": "按适配器和群号合并开启会话隔离后拆分的群聊",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时按 AstrBot 会话 ID 分开显示；开启后同群会话合并为一个聊天窗口。"
+  },
+  "show_onebot_profile": {
+    "description": "读取 OneBot 群资料和成员资料",
+    "type": "bool",
+    "default": true,
+    "hint": "适用于 OneBot v11（包括 NapCat、SnowLuna）；权限不足或接口不支持时显示已记录资料。"
+  },
+  "message_poll_interval_seconds": {
+    "description": "消息刷新间隔（秒）",
+    "type": "int",
+    "default": 3,
+    "hint": "允许 2–60 秒；降低频率可减少请求，增加频率可更快收到新消息。"
+  },
+  "group_poll_interval_seconds": {
+    "description": "会话列表刷新间隔（秒）",
+    "type": "int",
+    "default": 10,
+    "hint": "允许 5–120 秒；有新消息时已隐藏的会话将在刷新后重新出现。"
+  },
+  "max_messages": {
+    "description": "本地保留的聊天消息条数",
+    "type": "int",
+    "default": 5000,
+    "hint": "允许 500–50000 条，超出时自动清理最早的消息。"
+  },
+  "send_timeout_seconds": {
+    "description": "单条消息发送超时（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "允许 5–120 秒。超时后释放发送 worker；请先检查群聊确认送达情况，再决定是否重试。"
   }
 }

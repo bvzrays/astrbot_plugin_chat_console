@@ -2,7 +2,7 @@ name: astrbot_plugin_chat_console
 display_name: 聊天控制台
 desc: 在 AstrBot WebUI 中查看并控制各适配器的群聊消息。
 help: 打开插件详情页中的聊天控制台。
-version: 1.0.0
+version: 1.1.0
 author: BvzRays
 repo: https://github.com/bvzrays/astrbot_plugin_chat_console
 astrbot_version: ">=4.24.2"

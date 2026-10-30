@@ -26,6 +26,9 @@ PLUGIN_NAME = "astrbot_plugin_chat_console"
 MAX_MESSAGES = 5000
 MAX_SEND_QUEUE = 64
 SEND_WORKER_COUNT = 4
+SEND_TIMEOUT_SECONDS = 30
+GROUP_INFO_CACHE_SECONDS = 300
+GROUP_INFO_ERROR_CACHE_SECONDS = 30
 DATA_DIR = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
 DATABASE_FILE = DATA_DIR / "chat_console.db"
 LEGACY_MESSAGES_FILE = DATA_DIR / "messages.json"
@@ -89,6 +92,8 @@ def _ensure_database() -> None:
                 sender_id TEXT NOT NULL DEFAULT '',
                 sender_name TEXT NOT NULL DEFAULT '',
                 avatar TEXT NOT NULL DEFAULT '',
+                group_name TEXT NOT NULL DEFAULT '',
+                group_avatar TEXT NOT NULL DEFAULT '',
                 chain_json TEXT NOT NULL DEFAULT '[]',
                 is_mention INTEGER NOT NULL DEFAULT 0
             );
@@ -100,9 +105,74 @@ def _ensure_database() -> None:
                 ON messages(platform_id, session_id, sequence);
             """
         )
+        existing_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        for column in ("group_name", "group_avatar"):
+            if column not in existing_columns:
+                connection.execute(
+                    f"ALTER TABLE messages ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
 
 
-def _write_database_records(records: list[dict[str, Any]]) -> None:
+def _is_group_record(record: dict[str, Any]) -> bool:
+    message_type = _text(record.get("message_type")).upper().replace("_", "")
+    return "GROUPMESSAGE" in message_type
+
+
+def _group_bucket_key(adapter_id: str, group_id: str) -> str:
+    return f"{adapter_id}::group::{group_id}"
+
+
+def _conversation_key(record: dict[str, Any], merge_sessions: bool) -> str:
+    adapter_id = _text(record.get("platform_id"))
+    group_id = _text(record.get("group_id"))
+    session_id = _text(record.get("session_id"))
+    if merge_sessions and group_id:
+        return _group_bucket_key(adapter_id, group_id)
+    return f"{adapter_id}::{session_id}"
+
+
+def _http_url(value: Any) -> str:
+    candidate = _text(value)
+    return candidate if candidate.startswith(("https://", "http://")) else ""
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(int(value), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_plugin_state(key: str) -> Any:
+    _ensure_database()
+    with closing(_connect_database()) as connection:
+        row = connection.execute(
+            "SELECT value FROM plugin_state WHERE key = ?", (key,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["value"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _write_plugin_state(key: str, value: Any) -> None:
+    _ensure_database()
+    with closing(_connect_database()) as connection, connection:
+        connection.execute(
+            "INSERT INTO plugin_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, json.dumps(value, ensure_ascii=False)),
+        )
+
+
+def _write_database_records(
+    records: list[dict[str, Any]], max_messages: int = MAX_MESSAGES
+) -> None:
     """Insert message records and trim the database to the retention limit.
 
     Args:
@@ -125,6 +195,8 @@ def _write_database_records(records: list[dict[str, Any]]) -> None:
             _text(record.get("sender_id")),
             _text(record.get("sender_name")),
             _text(record.get("avatar")),
+            _text(record.get("group_name")),
+            _http_url(record.get("group_avatar")),
             json.dumps(record.get("chain", []), ensure_ascii=False),
             int(bool(record.get("is_mention", False))),
         )
@@ -139,8 +211,8 @@ def _write_database_records(records: list[dict[str, Any]]) -> None:
             INSERT OR IGNORE INTO messages (
                 id, created_at, platform_id, platform_name, umo, session_id,
                 message_type, group_id, role, sender_id, sender_name, avatar,
-                chain_json, is_mention
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                group_name, group_avatar, chain_json, is_mention
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -153,7 +225,30 @@ def _write_database_records(records: list[dict[str, Any]]) -> None:
                 LIMIT -1 OFFSET ?
             )
             """,
-            (MAX_MESSAGES,),
+            (max_messages,),
+        )
+
+
+def _update_group_metadata_database(
+    adapter_id: str, group_id: str, group_name: str, group_avatar: str
+) -> None:
+    if not group_name and not group_avatar:
+        return
+    _ensure_database()
+    with closing(_connect_database()) as connection, connection:
+        connection.execute(
+            "UPDATE messages SET "
+            "group_name = CASE WHEN ? != '' THEN ? ELSE group_name END, "
+            "group_avatar = CASE WHEN ? != '' THEN ? ELSE group_avatar END "
+            "WHERE platform_id = ? AND group_id = ?",
+            (
+                group_name,
+                group_name,
+                group_avatar,
+                group_avatar,
+                adapter_id,
+                group_id,
+            ),
         )
 
 
@@ -300,20 +395,60 @@ def _raw_media_urls(raw: Any) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-@register(PLUGIN_NAME, "BvzRays", "在 WebUI 查看并控制各适配器群聊消息", "1.0.0")
+@register(PLUGIN_NAME, "BvzRays", "在 WebUI 查看并控制各适配器群聊消息", "1.1.0")
 class ChatConsolePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.context = context
-        self.config = config or AstrBotConfig({"dark_mode": True})
+        self.config = config or AstrBotConfig(
+            {
+                "dark_mode": True,
+                "merge_isolated_sessions": False,
+                "show_onebot_profile": True,
+                "message_poll_interval_seconds": 3,
+                "group_poll_interval_seconds": 10,
+                "send_timeout_seconds": SEND_TIMEOUT_SECONDS,
+            }
+        )
+        self.max_messages = _bounded_int(
+            self.config.get("max_messages", MAX_MESSAGES), MAX_MESSAGES, 500, 50000
+        )
+        self.merge_isolated_sessions = bool(
+            self.config.get("merge_isolated_sessions", False)
+        )
+        self.show_onebot_profile = bool(self.config.get("show_onebot_profile", True))
+        self.message_poll_interval_seconds = _bounded_int(
+            self.config.get("message_poll_interval_seconds", 3), 3, 2, 60
+        )
+        self.group_poll_interval_seconds = _bounded_int(
+            self.config.get("group_poll_interval_seconds", 10), 10, 5, 120
+        )
+        self.send_timeout_seconds = _bounded_int(
+            self.config.get("send_timeout_seconds", SEND_TIMEOUT_SECONDS),
+            SEND_TIMEOUT_SECONDS,
+            5,
+            120,
+        )
         self._lock = asyncio.Lock()
         self._messages: list[dict[str, Any]] = self._initialize_database()
         self._messages_by_session: dict[str, list[dict[str, Any]]] = {}
+        self._messages_by_group: dict[str, list[dict[str, Any]]] = {}
         for item in self._messages:
             key = f"{item.get('platform_id', '')}::{item.get('session_id', '')}"
             self._messages_by_session.setdefault(key, []).append(item)
+            if _is_group_record(item):
+                group_key = _group_bucket_key(
+                    _text(item.get("platform_id")),
+                    _text(item.get("group_id")) or _text(item.get("session_id")),
+                )
+                self._messages_by_group.setdefault(group_key, []).append(item)
         self._pinned_groups: set[str] = self._load_pinned_groups()
         self._group_settings: dict[str, dict[str, Any]] = self._load_group_settings()
+        self._group_info_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._group_info_tasks: dict[str, asyncio.Task[dict[str, Any] | None]] = {}
+        self._group_info_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue(maxsize=32)
+        self._group_info_enqueued: set[str] = set()
+        self._group_info_workers: list[asyncio.Task] = []
         self._persist_queue: asyncio.Queue[object] = asyncio.Queue(maxsize=1)
         self._persist_task: asyncio.Task | None = None
         self._pending_database_records: list[dict[str, Any]] = []
@@ -326,7 +461,10 @@ class ChatConsolePlugin(Star):
         self._persistence_closing = False
         self._register_api("adapters", self.api_adapters, ["GET"], "获取适配器列表")
         self._register_api("settings", self.api_settings, ["GET"], "获取聊天控制台设置")
+        self._register_api("ui_state", self.api_ui_state, ["GET", "POST"], "保存聊天窗口选择")
         self._register_api("groups", self.api_groups, ["GET"], "获取群聊列表")
+        self._register_api("group_info", self.api_group_info, ["GET"], "读取 OneBot 群资料")
+        self._register_api("member_info", self.api_member_info, ["GET"], "读取 OneBot 群成员资料")
         self._register_api("messages", self.api_messages, ["GET"], "获取群聊消息")
         self._register_api("send", self.api_send, ["POST"], "发送群聊消息")
         self._register_api("send_media", self.api_send_media, ["POST"], "发送聊天媒体")
@@ -367,14 +505,14 @@ class ChatConsolePlugin(Star):
                 legacy_messages = None
             if isinstance(legacy_messages, list):
                 cleaned = []
-                for item in legacy_messages[-MAX_MESSAGES:]:
+                for item in legacy_messages[-self.max_messages :]:
                     if isinstance(item, dict):
                         copied = dict(item)
                         copied["chain"] = _sanitize_chain(copied.get("chain", []))[0]
                         if not _text(copied.get("id")):
                             copied["id"] = uuid.uuid4().hex
                         cleaned.append(copied)
-                _write_database_records(cleaned)
+                _write_database_records(cleaned, self.max_messages)
                 with closing(_connect_database()) as connection, connection:
                     connection.execute(
                         "INSERT OR REPLACE INTO plugin_state (key, value) VALUES (?, ?)",
@@ -401,12 +539,12 @@ class ChatConsolePlugin(Star):
                 """
                 SELECT id, created_at, platform_id, platform_name, umo, session_id,
                        message_type, group_id, role, sender_id, sender_name, avatar,
-                       chain_json, is_mention
+                       group_name, group_avatar, chain_json, is_mention
                 FROM messages
                 ORDER BY sequence DESC
                 LIMIT ?
                 """,
-                (MAX_MESSAGES,),
+                (self.max_messages,),
             ).fetchall()
         messages = []
         for row in reversed(rows):
@@ -428,6 +566,8 @@ class ChatConsolePlugin(Star):
                     "sender_id": row["sender_id"],
                     "sender_name": row["sender_name"],
                     "avatar": row["avatar"],
+                    "group_name": row["group_name"],
+                    "group_avatar": row["group_avatar"],
                     "chain": chain,
                     "is_mention": bool(row["is_mention"]),
                 }
@@ -470,7 +610,9 @@ class ChatConsolePlugin(Star):
         records = list(self._pending_database_records)
         if not records:
             return
-        await asyncio.to_thread(_write_database_records, records)
+        await asyncio.to_thread(
+            _write_database_records, records, self.max_messages
+        )
         del self._pending_database_records[: len(records)]
 
     async def _persistence_worker(self):
@@ -519,9 +661,15 @@ class ChatConsolePlugin(Star):
         self._messages.append(record)
         key = f"{record.get('platform_id', '')}::{record.get('session_id', '')}"
         self._messages_by_session.setdefault(key, []).append(record)
-        if len(self._messages) > MAX_MESSAGES:
-            removed = self._messages[:-MAX_MESSAGES]
-            del self._messages[:-MAX_MESSAGES]
+        if _is_group_record(record):
+            group_key = _group_bucket_key(
+                _text(record.get("platform_id")),
+                _text(record.get("group_id")) or _text(record.get("session_id")),
+            )
+            self._messages_by_group.setdefault(group_key, []).append(record)
+        if len(self._messages) > self.max_messages:
+            removed = self._messages[: -self.max_messages]
+            del self._messages[: -self.max_messages]
             for old in removed:
                 old_key = f"{old.get('platform_id', '')}::{old.get('session_id', '')}"
                 session_messages = self._messages_by_session.get(old_key)
@@ -529,6 +677,16 @@ class ChatConsolePlugin(Star):
                     session_messages.pop(0)
                     if not session_messages:
                         self._messages_by_session.pop(old_key, None)
+                if _is_group_record(old):
+                    old_group_key = _group_bucket_key(
+                        _text(old.get("platform_id")),
+                        _text(old.get("group_id")) or _text(old.get("session_id")),
+                    )
+                    group_messages = self._messages_by_group.get(old_group_key)
+                    if group_messages:
+                        group_messages.pop(0)
+                        if not group_messages:
+                            self._messages_by_group.pop(old_group_key, None)
         self._pending_database_records.append(record)
         self._queue_persistence()
 
@@ -536,6 +694,9 @@ class ChatConsolePlugin(Star):
         self._persist_task = asyncio.create_task(self._persistence_worker())
         self._send_workers = [
             asyncio.create_task(self._send_worker()) for _ in range(SEND_WORKER_COUNT)
+        ]
+        self._group_info_workers = [
+            asyncio.create_task(self._group_info_worker()) for _ in range(2)
         ]
 
     async def _send_worker(self):
@@ -547,22 +708,72 @@ class ChatConsolePlugin(Star):
             session_key, umo, message_chain, result = job
             lock = self._send_locks.setdefault(session_key, asyncio.Lock())
             try:
-                async with lock:
-                    sent = await self.context.send_message(umo, message_chain)
+                async def send_in_order() -> bool:
+                    async with lock:
+                        return await self.context.send_message(umo, message_chain)
+
+                sent = await asyncio.wait_for(
+                    send_in_order(), timeout=self.send_timeout_seconds
+                )
                 if not result.done():
                     result.set_result(
                         (
                             bool(sent),
-                            "" if sent else "适配器未找到或不支持该会话发送。",
+                            ""
+                            if sent
+                            else self._send_error_message(
+                                umo, "AstrBot 未找到支持该会话发送的适配器。"
+                            ),
                             502,
                         )
                     )
-            except Exception as exc:
-                logger.exception("chat_console: queued send failed")
+            except asyncio.TimeoutError:
+                logger.warning("chat_console: queued send timed out for %s", umo)
                 if not result.done():
-                    result.set_result((False, f"发送失败：{exc}", 500))
+                    result.set_result(
+                        (
+                            False,
+                            self._send_error_message(
+                                umo,
+                                "OneBot API 响应超时，送达状态未确认；请先检查群聊再重试",
+                            ),
+                            504,
+                        )
+                    )
+            except Exception as exc:
+                if exc.__class__.__name__ == "ApiNotAvailable":
+                    logger.warning("chat_console: send API unavailable for %s", umo)
+                else:
+                    logger.exception("chat_console: queued send failed")
+                if not result.done():
+                    status = 503 if exc.__class__.__name__ == "ApiNotAvailable" else 500
+                    result.set_result(
+                        (False, self._send_error_message(umo, exc), status)
+                    )
             finally:
                 self._send_queue.task_done()
+
+    def _send_error_message(self, umo: str, error: Any) -> str:
+        """Describe send failures with the adapter instance involved."""
+        adapter_id = _text(umo).split(":", 1)[0]
+        adapter_name = adapter_id or "当前适配器"
+        for platform in self._platforms():
+            try:
+                if _text(getattr(platform.meta(), "id", "")) == adapter_id:
+                    adapter_name = self._adapter_instance_name(platform, platform.meta())
+                    break
+            except Exception:
+                continue
+        if isinstance(error, str):
+            detail = error
+        elif error.__class__.__name__ == "ApiNotAvailable":
+            detail = "OneBot API 通道不可用，请检查该实例的反向 WebSocket API 连接"
+        else:
+            detail = f"发送失败：{error}"
+        return (
+            f"适配器“{adapter_name}”发送失败：{detail}。"
+            "请确认当前聊天窗口选中的是预期的适配器实例。"
+        )
 
     async def _queue_send(
         self,
@@ -592,6 +803,7 @@ class ChatConsolePlugin(Star):
             return
         session = event.session
         platform_id = event.get_platform_id()
+        group = getattr(getattr(event, "message_obj", None), "group", None)
         record = {
             "id": uuid.uuid4().hex,
             "created_at": time.time(),
@@ -605,6 +817,10 @@ class ChatConsolePlugin(Star):
             or _text(getattr(session, "message_type", "")),
             "group_id": _text(event.get_group_id())
             or _text(getattr(event.message_obj, "group_id", "")),
+            "group_name": _text(getattr(group, "group_name", "")),
+            "group_avatar": _http_url(
+                getattr(group, "group_avatar", "") or getattr(group, "avatar", "")
+            ),
             "role": role,
             "sender_id": sender_id,
             "sender_name": sender_name or ("机器人" if role == "bot" else "未知用户"),
@@ -655,29 +871,219 @@ class ChatConsolePlugin(Star):
     def _platforms(self) -> list[Any]:
         return list(self.context.platform_manager.get_insts())
 
+    @staticmethod
+    def _adapter_instance_name(platform: Any, meta: Any) -> str:
+        config = getattr(platform, "config", {})
+        if not isinstance(config, dict):
+            config = {}
+        for field in (
+            "adapter_display_name",
+            "display_name",
+            "adapter_name",
+            "account_name",
+            "alias",
+            "name",
+        ):
+            candidate = _text(config.get(field))
+            if candidate and candidate.casefold() != _text(getattr(meta, "name", "")).casefold():
+                return candidate
+        return _text(config.get("id")) or _text(getattr(meta, "id", "")) or _text(
+            getattr(meta, "adapter_display_name", "")
+        ) or _text(getattr(meta, "name", "适配器"))
+
+    def _onebot_platform(self, adapter_id: str) -> Any | None:
+        for platform in self._platforms():
+            try:
+                meta = platform.meta()
+                if _text(getattr(meta, "id", "")) != adapter_id:
+                    continue
+                platform_type = _text(getattr(meta, "name", "")).casefold()
+                class_name = type(platform).__name__.casefold()
+                if platform_type not in {"aiocqhttp", "onebot", "onebot11", "onebot_v11", "napcat", "snowluna"} and not any(
+                    marker in class_name for marker in ("aiocqhttp", "onebot", "napcat", "snowluna")
+                ):
+                    return None
+                client = getattr(platform, "bot", None) or getattr(platform, "client", None)
+                if not callable(getattr(client, "call_action", None)):
+                    getter = getattr(platform, "get_client", None)
+                    client = getter() if callable(getter) else client
+                if callable(getattr(client, "call_action", None)):
+                    return platform
+            except Exception:
+                continue
+        return None
+
+    def _schedule_group_info(self, adapter_id: str, group_id: str) -> None:
+        key = f"{adapter_id}::{group_id}"
+        if key in self._group_info_enqueued:
+            return
+        cache = self._group_info_cache.get(f"group::{adapter_id}::{group_id}::")
+        if cache and cache[0] > time.monotonic():
+            return
+        self._group_info_enqueued.add(key)
+        try:
+            self._group_info_queue.put_nowait((adapter_id, group_id))
+        except asyncio.QueueFull:
+            self._group_info_enqueued.discard(key)
+
+    async def _group_info_worker(self) -> None:
+        while True:
+            item = await self._group_info_queue.get()
+            if item is None:
+                self._group_info_queue.task_done()
+                return
+            adapter_id, group_id = item
+            queue_key = f"{adapter_id}::{group_id}"
+            try:
+                info = await self._onebot_action("group", adapter_id, group_id)
+                if info:
+                    group_key = _group_bucket_key(adapter_id, group_id)
+                    for message in self._messages_by_group.get(group_key, []):
+                        message["group_name"] = _text(info.get("group_name"))
+                        message["group_avatar"] = _http_url(info.get("group_avatar"))
+                    await asyncio.to_thread(
+                        _update_group_metadata_database,
+                        adapter_id,
+                        group_id,
+                        _text(info.get("group_name")),
+                        _http_url(info.get("group_avatar")),
+                    )
+            except Exception:
+                logger.debug("chat_console: OneBot group metadata refresh failed")
+            finally:
+                self._group_info_enqueued.discard(queue_key)
+                self._group_info_queue.task_done()
+
+    async def _onebot_action(
+        self,
+        kind: str,
+        adapter_id: str,
+        group_id: str,
+        user_id: str = "",
+    ) -> dict[str, Any] | None:
+        cache_key = "::".join((kind, adapter_id, group_id, user_id))
+        now = time.monotonic()
+        cached = self._group_info_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return dict(cached[1]) if cached[1] else None
+        task = self._group_info_tasks.get(cache_key)
+        if task is None:
+            async def fetch() -> dict[str, Any] | None:
+                platform = self._onebot_platform(adapter_id)
+                if platform is None:
+                    return None
+                client = getattr(platform, "bot", None) or getattr(platform, "client", None)
+                if not callable(getattr(client, "call_action", None)):
+                    getter = getattr(platform, "get_client", None)
+                    client = getter() if callable(getter) else client
+                call_action = getattr(client, "call_action", None)
+                if not callable(call_action):
+                    return None
+                group_value: int | str = int(group_id) if group_id.isdigit() else group_id
+                params: dict[str, Any] = {"group_id": group_value}
+                if kind == "member":
+                    params["user_id"] = int(user_id) if user_id.isdigit() else user_id
+                action = "get_group_info" if kind == "group" else "get_group_member_info"
+                try:
+                    response = await asyncio.wait_for(
+                        call_action(action=action, **params), timeout=6
+                    )
+                except Exception as exc:
+                    logger.debug("chat_console: OneBot %s lookup failed: %s", kind, exc)
+                    return None
+                if isinstance(response, dict) and "data" in response and (
+                    "status" in response or "retcode" in response
+                ):
+                    response = response.get("data")
+                if not isinstance(response, dict):
+                    return None
+                if kind == "group":
+                    fields = {
+                        "group_name": _text(response.get("group_name")),
+                        "member_count": response.get("member_count"),
+                        "max_member_count": response.get("max_member_count"),
+                        "group_avatar": _http_url(
+                            response.get("group_avatar")
+                            or response.get("avatar_url")
+                            or response.get("avatar")
+                        ),
+                    }
+                else:
+                    role = _text(response.get("role")).lower()
+                    fields = {
+                        "user_id": _text(response.get("user_id")) or user_id,
+                        "nickname": _text(response.get("nickname")),
+                        "card": _text(response.get("card")),
+                        "sex": _text(response.get("sex")),
+                        "age": response.get("age"),
+                        "area": _text(response.get("area")),
+                        "role": role,
+                        "level": _text(response.get("level")),
+                        "title": _text(response.get("title")),
+                        "join_time": response.get("join_time"),
+                        "last_sent_time": response.get("last_sent_time"),
+                        "avatar": (
+                            f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
+                            if user_id.isdigit()
+                            else ""
+                        ),
+                    }
+                return fields
+
+            task = asyncio.create_task(fetch())
+            self._group_info_tasks[cache_key] = task
+        try:
+            result = await task
+        finally:
+            if self._group_info_tasks.get(cache_key) is task:
+                self._group_info_tasks.pop(cache_key, None)
+        ttl = GROUP_INFO_CACHE_SECONDS if result else GROUP_INFO_ERROR_CACHE_SECONDS
+        self._group_info_cache[cache_key] = (time.monotonic() + ttl, result or {})
+        return dict(result) if result else None
+
     async def api_settings(self):
         """Return the configured initial theme for the chat console.
 
         Returns:
             JSON containing the configured dark-mode default.
         """
-        return json_response({"dark_mode": bool(self.config.get("dark_mode", True))})
+        global_config = self.context.get_config()
+        platform_settings = global_config.get("platform_settings", {})
+        isolation_enabled = bool(platform_settings.get("unique_session", False))
+        return json_response(
+            {
+                "dark_mode": bool(self.config.get("dark_mode", True)),
+                "merge_isolated_sessions": self.merge_isolated_sessions,
+                "show_onebot_profile": self.show_onebot_profile,
+                "message_poll_interval_seconds": self.message_poll_interval_seconds,
+                "group_poll_interval_seconds": self.group_poll_interval_seconds,
+                "send_timeout_seconds": self.send_timeout_seconds,
+                "max_messages": self.max_messages,
+                "session_isolation_enabled": isolation_enabled,
+            }
+        )
 
     async def api_adapters(self):
         items = []
         for platform in self._platforms():
             try:
                 meta = platform.meta()
+                platform_config = getattr(platform, "config", {})
                 items.append(
                     {
                         "id": _text(getattr(meta, "id", "")),
-                        "type": _text(getattr(meta, "name", "适配器")),
-                        "name": _text(getattr(meta, "adapter_display_name", ""))
-                        or _text(getattr(meta, "name", "适配器")),
+                        "name": self._adapter_instance_name(platform, meta),
+                        "display_name": self._adapter_instance_name(platform, meta),
+                        "adapter_type": _text(getattr(meta, "name", "适配器")),
                         "status": _text(
                             getattr(getattr(platform, "status", ""), "value", "")
                         )
                         or _text(getattr(platform, "status", "unknown")),
+                        "account_name": _text(
+                            platform_config.get("account_name", "")
+                            if isinstance(platform_config, dict)
+                            else ""
+                        ),
                     }
                 )
             except Exception as exc:
@@ -687,33 +1093,76 @@ class ChatConsolePlugin(Star):
     async def api_groups(self):
         adapter_id = _text(request.query.get("adapter_id", ""))
         groups: dict[str, dict[str, Any]] = {}
-        for session_key, session_messages in self._messages_by_session.items():
+        merge_sessions = self.merge_isolated_sessions
+        global_config = self.context.get_config()
+        isolation_enabled = bool(
+            global_config.get("platform_settings", {}).get("unique_session", False)
+        )
+        source = self._messages_by_group if merge_sessions else self._messages_by_session
+        for source_key, source_messages in source.items():
+            session_messages = list(source_messages)
             if not session_messages:
                 continue
             item = session_messages[-1]
             if adapter_id and item.get("platform_id") != adapter_id:
                 continue
             session_id = _text(item.get("session_id"))
-            message_type = _text(item.get("message_type")).upper().replace("_", "")
-            if not session_id or "GROUPMESSAGE" not in message_type:
+            if not session_id or not _is_group_record(item):
                 continue
-            key = session_key
+            group_id = _text(item.get("group_id")) or session_id
+            key = source_key
+            settings = self._group_settings.get(key, {})
+            hidden_at = float(settings.get("hidden_at", 0) or 0)
+            if hidden_at and float(item.get("created_at", 0) or 0) <= hidden_at:
+                continue
             last_read = float(
-                self._group_settings.get(key, {}).get("last_read", 0) or 0
+                settings.get("last_read", 0) or 0
             )
+            group_name = next(
+                (_text(message.get("group_name")) for message in reversed(session_messages) if _text(message.get("group_name"))),
+                "",
+            )
+            group_avatar = next(
+                (_http_url(message.get("group_avatar")) for message in reversed(session_messages) if _http_url(message.get("group_avatar"))),
+                "",
+            )
+            group_info_key = f"group::{_text(item.get('platform_id'))}::{group_id}::"
+            cached_info = self._group_info_cache.get(group_info_key)
+            if cached_info and cached_info[0] > time.monotonic():
+                group_name = _text(cached_info[1].get("group_name")) or group_name
+                group_avatar = _http_url(cached_info[1].get("group_avatar")) or group_avatar
             groups[key] = {
                 "key": key,
                 "adapter_id": item.get("platform_id", ""),
                 "adapter_name": item.get("platform_name", ""),
-                "group_id": _text(item.get("group_id")) or session_id,
+                "group_id": group_id,
+                "group_name": group_name,
+                "group_avatar": group_avatar,
                 "session_id": session_id,
+                "session_ids": sorted(
+                    {
+                        _text(message.get("session_id"))
+                        for message in session_messages
+                        if _text(message.get("session_id"))
+                    }
+                ),
                 "last_message_at": item.get("created_at", 0),
                 "last_preview": self._preview(item.get("chain", [])),
                 "pinned": key in self._pinned_groups,
                 "can_send": self._can_send(item.get("platform_id", "")),
                 "active_reply_enabled": self._active_reply_enabled(item.get("umo", "")),
                 "group_id_kind": "group_openid",
-                "remark": _text(self._group_settings.get(key, {}).get("remark")),
+                "session_isolated": any(
+                    _text(message.get("session_id")) != group_id
+                    for message in session_messages
+                ),
+                "isolation_notice": isolation_enabled,
+                "merge_enabled": merge_sessions,
+                "profile_supported": bool(
+                    self.config.get("show_onebot_profile", True)
+                    and self._onebot_platform(_text(item.get("platform_id")))
+                ),
+                "remark": _text(settings.get("remark")),
                 "unread": sum(
                     message.get("role") == "user"
                     and float(message.get("created_at", 0) or 0) > last_read
@@ -745,6 +1194,10 @@ class ChatConsolePlugin(Star):
                     "",
                 ),
             }
+        if self.show_onebot_profile:
+            for group in groups.values():
+                if group.get("profile_supported") and not group.get("group_name"):
+                    self._schedule_group_info(group["adapter_id"], group["group_id"])
         return json_response(
             {
                 "groups": sorted(
@@ -764,6 +1217,20 @@ class ChatConsolePlugin(Star):
             except Exception:
                 continue
         return False
+
+    def _find_send_target(
+        self, adapter_id: str, session_id: str, group_id: str = ""
+    ) -> dict[str, Any] | None:
+        if self.merge_isolated_sessions and group_id:
+            records = self._messages_by_group.get(
+                _group_bucket_key(adapter_id, group_id), []
+            )
+            if records:
+                return records[-1]
+        records = self._messages_by_session.get(
+            f"{adapter_id}::{session_id}", []
+        )
+        return records[-1] if records else None
 
     def _active_reply_enabled(self, umo: str) -> bool | None:
         """Read the active-reply flag bound to one unified message origin.
@@ -868,25 +1335,107 @@ class ChatConsolePlugin(Star):
                     settings["remark"] = _text(payload.get("remark"))[:80]
                 if payload.get("read"):
                     settings["last_read"] = time.time()
+                if payload.get("delete"):
+                    latest = max(
+                        (
+                            float(message.get("created_at", 0) or 0)
+                            for message in self._messages
+                            if _conversation_key(message, self.merge_isolated_sessions)
+                            == key
+                        ),
+                        default=time.time(),
+                    )
+                    settings["hidden_at"] = latest
                 await self._save_group_settings()
         return json_response(
             {
                 "key": key,
                 "remark": _text(settings.get("remark")),
                 "last_read": settings.get("last_read", 0),
+                "deleted": bool(settings.get("hidden_at")),
             }
         )
+
+    async def api_ui_state(self):
+        if request.method == "GET":
+            try:
+                client_id = uuid.UUID(
+                    _text(request.query.get("client_id", ""))
+                ).hex
+            except (ValueError, AttributeError):
+                return error_response("client_id 无效。", status_code=400)
+            state_key = f"ui_state:{client_id}"
+            state = await asyncio.to_thread(_read_plugin_state, state_key)
+            return json_response(state or {"adapter_id": "", "groups_by_adapter": {}})
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。", status_code=400)
+        try:
+            client_id = uuid.UUID(_text(payload.get("client_id"))).hex
+        except (ValueError, AttributeError):
+            return error_response("client_id 无效。", status_code=400)
+        state_key = f"ui_state:{client_id}"
+        adapter_id = _text(payload.get("adapter_id"))[:200]
+        group_key = _text(payload.get("group_key"))[:512]
+        state = await asyncio.to_thread(_read_plugin_state, state_key) or {}
+        groups_by_adapter = state.get("groups_by_adapter", {})
+        if not isinstance(groups_by_adapter, dict):
+            groups_by_adapter = {}
+        groups_by_adapter = {
+            _text(key)[:200]: _text(value)[:512]
+            for key, value in groups_by_adapter.items()
+            if _text(key) and _text(value)
+        }
+        if adapter_id and group_key:
+            groups_by_adapter[adapter_id] = group_key
+        if adapter_id and payload.get("clear_group"):
+            groups_by_adapter.pop(adapter_id, None)
+        state = {"adapter_id": adapter_id, "groups_by_adapter": groups_by_adapter}
+        await asyncio.to_thread(_write_plugin_state, state_key, state)
+        return json_response(state)
+
+    async def api_group_info(self):
+        adapter_id = _text(request.query.get("adapter_id", ""))
+        group_id = _text(request.query.get("group_id", ""))
+        if not adapter_id or not group_id:
+            return error_response("adapter_id 和 group_id 不能为空。", status_code=400)
+        if not self.show_onebot_profile:
+            return error_response("OneBot 资料查询已关闭。", status_code=403)
+        info = await self._onebot_action("group", adapter_id, group_id)
+        if not info:
+            return error_response("当前适配器不支持 OneBot 群资料查询。", status_code=404)
+        return json_response(info)
+
+    async def api_member_info(self):
+        adapter_id = _text(request.query.get("adapter_id", ""))
+        group_id = _text(request.query.get("group_id", ""))
+        user_id = _text(request.query.get("user_id", ""))
+        if not adapter_id or not group_id or not user_id:
+            return error_response(
+                "adapter_id、group_id 和 user_id 不能为空。", status_code=400
+            )
+        if not self.show_onebot_profile:
+            return error_response("OneBot 资料查询已关闭。", status_code=403)
+        info = await self._onebot_action("member", adapter_id, group_id, user_id)
+        if not info:
+            return error_response("当前适配器不支持 OneBot 成员资料查询。", status_code=404)
+        return json_response(info)
 
     async def api_messages(self):
         adapter_id = _text(request.query.get("adapter_id", ""))
         session_id = _text(request.query.get("session_id", ""))
+        group_id = _text(request.query.get("group_id", ""))
         after_id = _text(request.query.get("after_id", ""))
         from_id = _text(request.query.get("from_id", ""))
         try:
             limit = max(1, min(int(request.query.get("limit", 200)), 500))
         except (TypeError, ValueError):
             limit = 200
-        if adapter_id and session_id:
+        if self.merge_isolated_sessions and adapter_id and group_id:
+            messages = self._messages_by_group.get(
+                _group_bucket_key(adapter_id, group_id), []
+            )
+        elif adapter_id and session_id:
             messages = self._messages_by_session.get(f"{adapter_id}::{session_id}", [])
         else:
             messages = [
@@ -894,6 +1443,7 @@ class ChatConsolePlugin(Star):
                 for item in self._messages
                 if (not adapter_id or item.get("platform_id") == adapter_id)
                 and (not session_id or item.get("session_id") == session_id)
+                and (not group_id or item.get("group_id") == group_id)
             ]
         reset = False
         if from_id:
@@ -963,6 +1513,7 @@ class ChatConsolePlugin(Star):
             return error_response("请求体必须是 JSON 对象。", status_code=400)
         adapter_id = _text(payload.get("adapter_id"))
         session_id = _text(payload.get("session_id"))
+        group_id = _text(payload.get("group_id"))
         image_data = _text(payload.get("data"))
         if not adapter_id or not session_id or not image_data:
             return error_response(
@@ -976,21 +1527,13 @@ class ChatConsolePlugin(Star):
             return error_response("图片数据不是有效的 Base64。", status_code=400)
         if decoded_size > 12 * 1024 * 1024:
             return error_response("图片不能超过 12 MB。", status_code=413)
-        target = next(
-            (
-                item
-                for item in reversed(self._messages)
-                if item.get("platform_id") == adapter_id
-                and item.get("session_id") == session_id
-            ),
-            None,
-        )
+        target = self._find_send_target(adapter_id, session_id, group_id)
         if not target:
             return error_response("未找到该群聊会话。", status_code=404)
         if not self._can_send(adapter_id):
             return error_response("当前适配器不支持主动发言。", status_code=403)
         sent, error, status = await self._queue_send(
-            f"{adapter_id}::{session_id}",
+            f"{adapter_id}::{target.get('group_id') or session_id}",
             _text(target.get("umo")),
             MessageChain([Image.fromBase64(image_data)]),
         )
@@ -1006,6 +1549,8 @@ class ChatConsolePlugin(Star):
                 "session_id": session_id,
                 "message_type": target.get("message_type", "GroupMessage"),
                 "group_id": target.get("group_id", session_id),
+                "group_name": target.get("group_name", ""),
+                "group_avatar": target.get("group_avatar", ""),
                 "role": "bot",
                 "sender_id": "",
                 "sender_name": "机器人",
@@ -1021,6 +1566,7 @@ class ChatConsolePlugin(Star):
             return error_response("请求体必须是 JSON 对象。", status_code=400)
         adapter_id = _text(payload.get("adapter_id"))
         session_id = _text(payload.get("session_id"))
+        group_id = _text(payload.get("group_id"))
         content = _text(payload.get("content"))
         image_data = _text(payload.get("image_data"))
         if not adapter_id or not session_id or (not content and not image_data):
@@ -1028,14 +1574,7 @@ class ChatConsolePlugin(Star):
                 "adapter_id、session_id 和 content 或 image_data 不能为空。",
                 status_code=400,
             )
-        target = None
-        for item in reversed(self._messages):
-            if (
-                item.get("platform_id") == adapter_id
-                and item.get("session_id") == session_id
-            ):
-                target = item
-                break
+        target = self._find_send_target(adapter_id, session_id, group_id)
         if not target:
             return error_response(
                 "未找到该适配器的群聊会话，请先让机器人收到该群消息。", status_code=404
@@ -1057,7 +1596,7 @@ class ChatConsolePlugin(Star):
             outgoing.append(Plain(content))
         umo = _text(target.get("umo"))
         sent, error, status = await self._queue_send(
-            f"{adapter_id}::{session_id}",
+            f"{adapter_id}::{target.get('group_id') or session_id}",
             umo,
             MessageChain(outgoing),
         )
@@ -1073,6 +1612,8 @@ class ChatConsolePlugin(Star):
                 "session_id": session_id,
                 "message_type": target.get("message_type", "GroupMessage"),
                 "group_id": target.get("group_id", session_id),
+                "group_name": target.get("group_name", ""),
+                "group_avatar": target.get("group_avatar", ""),
                 "role": "bot",
                 "sender_id": "",
                 "sender_name": "机器人",
@@ -1104,6 +1645,11 @@ class ChatConsolePlugin(Star):
 
     async def terminate(self):
         self._stopping = True
+        if self._group_info_workers:
+            for _ in self._group_info_workers:
+                await self._group_info_queue.put(None)
+            await asyncio.gather(*self._group_info_workers, return_exceptions=True)
+            self._group_info_workers.clear()
         if self._send_workers:
             await self._send_queue.join()
             for _ in self._send_workers:
